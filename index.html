@@ -5,15 +5,29 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#1677ff">
 <title>ADAS Route Risk Extended v3.2</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/antd@5/dist/reset.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/antd@5.26.0/dist/reset.css">
 <style>html,body,#root{margin:0;min-height:100%;width:100%;}body{font-family:Arial,"Microsoft JhengHei",sans-serif;background:#f5f7fa;}*{box-sizing:border-box}</style>
 </head>
 <body>
-<div id="root"></div>
-<script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/antd@5/dist/antd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+<div id="root"><div style="padding:24px;font-family:Arial,'Microsoft JhengHei',sans-serif">ADAS Route Risk Extended v3.2 載入中…</div></div>
+<script>
+window.addEventListener('error', function(e) {
+  const root = document.getElementById('root');
+  if (root && root.innerText.includes('載入中')) {
+    root.innerHTML = '<div style="padding:24px;font-family:Arial,Microsoft JhengHei,sans-serif;color:#b42318"><h2>網頁載入失敗</h2><p>請重新整理頁面，或確認 GitHub Pages 可連線至 CDN。</p><pre style="white-space:pre-wrap;background:#f5f5f5;padding:12px;border-radius:8px">' + String(e.message || 'Unknown error') + '</pre></div>';
+  }
+});
+window.addEventListener('unhandledrejection', function(e) {
+  const root = document.getElementById('root');
+  if (root && root.innerText.includes('載入中')) {
+    root.innerHTML = '<div style="padding:24px;font-family:Arial,Microsoft JhengHei,sans-serif;color:#b42318"><h2>網頁載入失敗</h2><pre style="white-space:pre-wrap;background:#f5f5f5;padding:12px;border-radius:8px">' + String(e.reason || 'Unknown rejection') + '</pre></div>';
+  }
+});
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/antd@5.26.0/dist/antd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.8/babel.min.js"></script>
 <script type="text/babel" data-presets="react">
 const React = window.React;
 const { useEffect, useMemo, useRef, useState } = React;
