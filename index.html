@@ -1,0 +1,2496 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#1677ff">
+<title>ADAS Route Risk Extended v3.2</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/antd@5/dist/reset.css">
+<style>html,body,#root{margin:0;min-height:100%;width:100%;}body{font-family:Arial,"Microsoft JhengHei",sans-serif;background:#f5f7fa;}*{box-sizing:border-box}</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/antd@5/dist/antd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+<script type="text/babel" data-presets="react">
+const React = window.React;
+const { useEffect, useMemo, useRef, useState } = React;
+const { InputNumber, Select, Checkbox, Button, Tabs, Tag, Divider, Progress, Switch } = window.antd;
+const WHEELBASE = 2.75;
+const CONTROL_DT = 0.02;
+const MAX_STEER = 12 * Math.PI / 180;
+const HISTORY_SECONDS = 30;
+
+/**
+ * ADAS Route Risk Extended Simulator
+ * ------------------------------------------------------------
+ * 目的：
+ * 1) 保留原本 Frenet / 圓弧道路、LFS PD、AEB 架構。
+ * 2) 加入道路等級、行駛方向、車道數、道路寬度、窄道、車流。
+ * 3) 支援不同 ADAS 參數版本。
+ * 4) 使用 Monte-Carlo 多次試跑估算「模擬事故率」。
+ *
+ * 注意：
+ * 「事故率」是本工具定義的 Simulation Accident Rate，
+ * 只代表在目前假設、擾動與判定規則下的模擬結果，
+ * 不是道路真實事故機率、NCAP 成績或量產安全指標。
+ */
+
+const ROAD_TYPES = {
+  h1: {
+    label: 'H1 高速／快速／州際公路',
+    speedLimit: 100,
+    baseWidth: 3.5,
+    difficulty: 1.00,
+    trafficBase: 0.35,
+  },
+  h2: {
+    label: 'H2 縣市主要道路',
+    speedLimit: 70,
+    baseWidth: 3.3,
+    difficulty: 1.12,
+    trafficBase: 0.50,
+  },
+  h3: {
+    label: 'H3 縣市次要道路',
+    speedLimit: 60,
+    baseWidth: 3.0,
+    difficulty: 1.28,
+    trafficBase: 0.62,
+  },
+  h4: {
+    label: 'H4 鄉道／巷弄',
+    speedLimit: 40,
+    baseWidth: 2.7,
+    difficulty: 1.55,
+    trafficBase: 0.78,
+  },
+};
+
+const MOVES = {
+  s1: { label: 'S1 直走', curvature: 'straight', turn: 1, difficulty: 1.00 },
+  s2: { label: 'S2 左彎／左轉', curvature: 'curve', turn: 1, difficulty: 1.18 },
+  s3: { label: 'S3 其他／複合路型', curvature: 'curve', turn: -1, difficulty: 1.30 },
+  s4: { label: 'S4 左轉', curvature: 'turn', turn: 1, difficulty: 1.45 },
+};
+
+
+const TURN_SCENARIOS = {
+  straight: { label: '直走 0°', angle: 0, radius: Infinity, type: 'straight' },
+  left15: { label: '左 15°', angle: 15, radius: 80, type: 'turn' },
+  left30: { label: '左 30°', angle: 30, radius: 65, type: 'turn' },
+  left45: { label: '左 45°', angle: 45, radius: 55, type: 'turn' },
+  left60: { label: '左 60°', angle: 60, radius: 45, type: 'turn' },
+  left90: { label: '左 90°', angle: 90, radius: 32, type: 'intersection' },
+  right15: { label: '右 15°', angle: -15, radius: 80, type: 'turn' },
+  right30: { label: '右 30°', angle: -30, radius: 65, type: 'turn' },
+  right45: { label: '右 45°', angle: -45, radius: 55, type: 'turn' },
+  right60: { label: '右 60°', angle: -60, radius: 45, type: 'turn' },
+  right90: { label: '右 90°', angle: -90, radius: 32, type: 'intersection' },
+  u180: { label: 'U-turn 180°', angle: 180, radius: 18, type: 'uturn' },
+  t_left90: { label: 'T 路口 左 90°', angle: 90, radius: 24, type: 't_intersection' },
+  t_right90: { label: 'T 路口 右 90°', angle: -90, radius: 24, type: 't_intersection' },
+};
+
+const WIDTH_MODES = {
+  standard: { label: '標準道路寬度', factor: 1.00 },
+  narrow: { label: '窄道', factor: 0.78 },
+  custom: { label: '自訂寬度', factor: 1.00 },
+};
+
+const PRESETS = {
+  baseline: {
+    name: 'V1 基準',
+    kp: 1.2,
+    kd: 0.25,
+    kpsi: 0.65,
+    ttcThreshold: 2.2,
+    distThreshold: 15,
+    maxDecel: 8,
+    sensorNoise: 0.03,
+    steeringNoise: 0.02,
+    responseDelay: 0.00,
+  },
+  soft: {
+    name: 'V2 柔和控制',
+    kp: 0.85,
+    kd: 0.18,
+    kpsi: 0.50,
+    ttcThreshold: 2.4,
+    distThreshold: 16,
+    maxDecel: 7.0,
+    sensorNoise: 0.04,
+    steeringNoise: 0.028,
+    responseDelay: 0.05,
+  },
+  aggressive: {
+    name: 'V3 積極控制',
+    kp: 1.55,
+    kd: 0.34,
+    kpsi: 0.82,
+    ttcThreshold: 2.0,
+    distThreshold: 13,
+    maxDecel: 9.0,
+    sensorNoise: 0.025,
+    steeringNoise: 0.018,
+    responseDelay: 0.00,
+  },
+};
+
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+const kmh = (value) => value * 3.6;
+const ms = (value) => value / 3.6;
+const deg = (value) => value * 180 / Math.PI;
+const normalizeAngle = (value) => Math.atan2(Math.sin(value), Math.cos(value));
+const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+
+function randn() {
+  let u = 0;
+  let v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+function weightedTrafficCount(p) {
+  const road = ROAD_TYPES[p.roadType] || ROAD_TYPES.h2;
+  const density = clamp(finite(p.trafficDensity, 50) / 100, 0, 1);
+  const expected = 1 + density * 5 + road.trafficBase * 2;
+  return Math.round(clamp(expected + randn() * 1.2, 0, 10));
+}
+
+function roadWidthFor(p) {
+  if (p.widthMode === 'custom') return clamp(finite(p.customLaneWidth, 3.5), 2.2, 5.0);
+  const base = ROAD_TYPES[p.roadType]?.baseWidth || 3.5;
+  if (p.widthMode === 'narrow') return base * WIDTH_MODES.narrow.factor;
+  return base;
+}
+
+function safeLaneBoundary(laneWidth, laneCount) {
+  return Math.max(0.75, laneWidth * laneCount / 2 - 0.25);
+}
+
+
+function parseMetricNumber(value, fallback = NaN) {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : fallback;
+  const s = String(value).replace(',', '.');
+  const m = s.match(/-?\d+(?:\.\d+)?/);
+  return m ? Number(m[0]) : fallback;
+}
+
+function inferRoadLevel(props = {}) {
+  const h = String(props.highway || props.road_class || props.roadType || props.class || props.road_level || '').toLowerCase();
+  const ref = String(props.ref || props.route || '').toUpperCase();
+
+  if (['h1', 'h2', 'h3', 'h4'].includes(h)) return h;
+  if (['motorway', 'motorway_link', 'trunk', 'trunk_link'].includes(h)) return 'h1';
+  if (['primary', 'primary_link'].includes(h)) return 'h2';
+  if (['secondary', 'secondary_link', 'tertiary', 'tertiary_link'].includes(h)) return 'h3';
+
+  // 台灣 OSM：住宅巷弄、服務道路與未分類道路不直接等同「狹窄」，
+  // 寬度仍應優先使用 width / est_width；此處只做情境層級的保守映射。
+  if (['residential', 'living_street', 'service', 'unclassified', 'road', 'track'].includes(h)) return 'h4';
+
+  // 若資料沒有 highway，可用較明顯的高速道路 reference 作次要判斷。
+  if (/^(G|E|I|A)\s*[-]?\d+/i.test(ref) && /I|A/i.test(ref)) return 'h1';
+
+  return 'h3';
+}
+
+function parseLaneCount(props = {}, roadType = 'h3') {
+  const candidates = [
+    props.lanes,
+    props.lane_count,
+    props.num_lanes,
+    props.number_of_lanes,
+  ];
+  for (const value of candidates) {
+    const n = parseMetricNumber(value, NaN);
+    if (Number.isFinite(n) && n >= 1 && n <= 12) return Math.round(n);
+  }
+
+  if (roadType === 'h1') return 2;
+  if (roadType === 'h2') return 2;
+  if (roadType === 'h3') return 2;
+  return 1;
+}
+
+function parseRoadWidth(props = {}, roadType = 'h3', lanes = 2) {
+  const laneSpecific = [
+    props.lane_width,
+    props.laneWidth,
+    props.width_per_lane,
+  ];
+  for (const value of laneSpecific) {
+    const n = parseMetricNumber(value, NaN);
+    if (Number.isFinite(n) && n >= 2 && n <= 6) return n;
+  }
+
+  const candidates = [
+    props.width,
+    props.est_width,
+    props.estimated_width,
+    props.width_m,
+    props.road_width,
+  ];
+
+  for (const value of candidates) {
+    const n = parseMetricNumber(value, NaN);
+    if (Number.isFinite(n) && n >= 2 && n <= 60) {
+      // OSM width 通常是整條道路寬度；程式內部使用「單一道路寬度」。
+      return clamp(n / Math.max(1, lanes), 2.2, 5.5);
+    }
+  }
+
+  const base = ROAD_TYPES[roadType]?.baseWidth || 3.0;
+  return clamp(base, 2.2, 5.5);
+}
+
+function parseRoadSpeed(props = {}, roadType = 'h3') {
+  const candidates = [
+    props.maxspeed,
+    props.speed_limit,
+    props.max_speed,
+    props.speed,
+  ];
+  for (const value of candidates) {
+    const n = parseMetricNumber(value, NaN);
+    if (Number.isFinite(n) && n > 0 && n <= 220) return n;
+  }
+  return ROAD_TYPES[roadType]?.speedLimit || 60;
+}
+
+function parseTrafficDensity(props = {}, roadType = 'h3') {
+  const direct = [
+    props.traffic_density,
+    props.trafficDensity,
+    props.traffic_percent,
+    props.traffic,
+    props.congestion,
+  ];
+  for (const value of direct) {
+    const n = parseMetricNumber(value, NaN);
+    if (Number.isFinite(n)) {
+      if (n > 100 && n < 200000) {
+        // 粗略把高流量資料映射成 0~100 情境密度；這只是模擬輸入。
+        return Math.round(clamp((n / 100000) * 100, 0, 100));
+      }
+      return Math.round(clamp(n, 0, 100));
+    }
+  }
+  return Math.round((ROAD_TYPES[roadType]?.trafficBase || 0.5) * 100);
+}
+
+function extractLineParts(geometry) {
+  if (!geometry) return [];
+  if (geometry.type === 'LineString') return [geometry.coordinates];
+  if (geometry.type === 'MultiLineString') return geometry.coordinates;
+  return [];
+}
+
+function geoDistanceMeters(a, b) {
+  if (!a || !b) return 0;
+  const lon1 = a[0] * Math.PI / 180;
+  const lat1 = a[1] * Math.PI / 180;
+  const lon2 = b[0] * Math.PI / 180;
+  const lat2 = b[1] * Math.PI / 180;
+  const R = 6371000;
+  const x = (lon2 - lon1) * Math.cos((lat1 + lat2) / 2);
+  const y = lat2 - lat1;
+  return Math.sqrt(x * x + y * y) * R;
+}
+
+function buildRouteFromCoordinates(coords) {
+  if (!Array.isArray(coords) || coords.length < 2) return null;
+
+  const origin = coords[0];
+  const lat0 = Number(origin[1]) * Math.PI / 180;
+  const R = 6371000;
+
+  const points = coords.map((c) => {
+    const lon = Number(c[0]);
+    const lat = Number(c[1]);
+    return {
+      lon,
+      lat,
+      x: (lon - Number(origin[0])) * Math.PI / 180 * R * Math.cos(lat0),
+      y: (lat - Number(origin[1])) * Math.PI / 180 * R,
+    };
+  });
+
+  let total = 0;
+  points[0].s = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    total += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+    points[i].s = total;
+  }
+
+  if (total < 10) return null;
+
+  // Remove duplicate / near-duplicate points while preserving the original order.
+  const filtered = [points[0]];
+  for (let i = 1; i < points.length; i += 1) {
+    const prev = filtered[filtered.length - 1];
+    if (Math.hypot(points[i].x - prev.x, points[i].y - prev.y) >= 0.5) {
+      filtered.push(points[i]);
+    }
+  }
+  if (filtered.length < 2) return null;
+
+  // Recompute cumulative s after filtering.
+  let sAcc = 0;
+  filtered[0].s = 0;
+  for (let i = 1; i < filtered.length; i += 1) {
+    sAcc += Math.hypot(filtered[i].x - filtered[i - 1].x, filtered[i].y - filtered[i - 1].y);
+    filtered[i].s = sAcc;
+  }
+
+  return {
+    points: filtered,
+    length: sAcc,
+    origin,
+  };
+}
+
+
+function inferManeuverFromRoute(route) {
+  if (!route?.points || route.points.length < 5) return 's1';
+
+  const pts = route.points;
+  const headings = [];
+  for (let i = 1; i < pts.length; i += Math.max(1, Math.floor(pts.length / 12))) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    headings.push(Math.atan2(b.y - a.y, b.x - a.x));
+  }
+  if (headings.length < 2) return 's1';
+
+  let totalTurn = 0;
+  let signedTurn = 0;
+  for (let i = 1; i < headings.length; i += 1) {
+    const d = normalizeAngle(headings[i] - headings[i - 1]);
+    totalTurn += Math.abs(d);
+    signedTurn += d;
+  }
+
+  // 小幅度航向變化視為直走。
+  if (totalTurn < 0.10) return 's1';
+
+  // 明顯單向左彎。
+  if (signedTurn > 0.35 && totalTurn < 2.5) return 's2';
+
+  // 複合、多次左右變化。
+  if (totalTurn >= 2.5 || Math.abs(signedTurn) < 0.18) return 's3';
+
+  // 很大的單次左轉，作為 S4 左轉情境。
+  if (signedTurn > 1.0) return 's4';
+
+  return 's3';
+}
+
+function routeCurvatureAtS(route, sCoord) {
+  if (!route?.points || route.points.length < 3) return 0;
+
+  const s = clamp(sCoord, 0, route.length);
+  let idx = 1;
+  while (idx < route.points.length - 1 && route.points[idx + 1].s < s) idx += 1;
+
+  const a = route.points[Math.max(0, idx - 1)];
+  const b = route.points[idx];
+  const c = route.points[Math.min(route.points.length - 1, idx + 1)];
+
+  const abx = b.x - a.x;
+  const aby = b.y - a.y;
+  const bcx = c.x - b.x;
+  const bcy = c.y - b.y;
+  const lab = Math.hypot(abx, aby);
+  const lbc = Math.hypot(bcx, bcy);
+  if (lab < 0.01 || lbc < 0.01) return 0;
+
+  const cross = abx * bcy - aby * bcx;
+  const dot = abx * bcx + aby * bcy;
+  const angle = Math.atan2(cross, dot);
+  const ds = Math.max(1, (c.s - a.s + c.s - b.s) / 2);
+  return clamp(angle / ds, -0.2, 0.2);
+}
+
+function buildGeoJSONRoadCatalog(geojson) {
+  const features = geojson?.type === 'FeatureCollection'
+    ? geojson.features || []
+    : geojson?.type === 'Feature'
+      ? [geojson]
+      : [];
+
+  const catalog = [];
+
+  features.forEach((feature, featureIndex) => {
+    const props = feature?.properties || {};
+    const roadType = inferRoadLevel(props);
+    const lanes = parseLaneCount(props, roadType);
+    const laneWidth = parseRoadWidth(props, roadType, lanes);
+    const speedLimit = parseRoadSpeed(props, roadType);
+    const trafficDensity = parseTrafficDensity(props, roadType);
+
+    const parts = extractLineParts(feature?.geometry);
+    if (!parts.length) return;
+
+    // MultiLineString：取最長子線段做主要模擬路徑。
+    let selected = null;
+    parts.forEach((part) => {
+      const route = buildRouteFromCoordinates(part);
+      if (route && (!selected || route.length > selected.length)) selected = route;
+    });
+    if (!selected) return;
+
+    const name =
+      props.name ||
+      props.ref ||
+      props.road_name ||
+      props.road ||
+      `Road ${featureIndex + 1}`;
+
+    catalog.push({
+      id: feature?.id ?? featureIndex,
+      name: String(name),
+      highway: String(props.highway || props.road_class || 'unknown'),
+      ref: String(props.ref || ''),
+      roadType,
+      roadTypeLabel: ROAD_TYPES[roadType]?.label || roadType,
+      lanes,
+      laneWidth,
+      widthTotal: laneWidth * lanes,
+      speedLimit,
+      trafficDensity,
+      oneWay: String(props.oneway || '').toLowerCase() === 'yes',
+      surface: props.surface || '',
+      bridge: props.bridge || '',
+      tunnel: props.tunnel || '',
+      turnLanes: props['turn:lanes'] || '',
+      maneuver: inferManeuverFromRoute(selected),
+      props,
+      route: selected,
+    });
+  });
+
+  return catalog;
+}
+
+function routePointAtS(route, sCoord, laneOffset = 0) {
+  if (!route?.points?.length) {
+    return { x: sCoord, y: laneOffset, yaw: 0, nx: 0, ny: 1, tx: 1, ty: 0 };
+  }
+
+  const s = clamp(sCoord, 0, route.length);
+  const pts = route.points;
+
+  let idx = 1;
+  while (idx < pts.length && pts[idx].s < s) idx += 1;
+  if (idx >= pts.length) idx = pts.length - 1;
+
+  const a = pts[Math.max(0, idx - 1)];
+  const b = pts[idx];
+  const ds = Math.max(0.001, b.s - a.s);
+  const u = clamp((s - a.s) / ds, 0, 1);
+
+  const x = a.x + (b.x - a.x) * u;
+  const y = a.y + (b.y - a.y) * u;
+  const txRaw = (b.x - a.x) / ds;
+  const tyRaw = (b.y - a.y) / ds;
+  const norm = Math.hypot(txRaw, tyRaw) || 1;
+  const tx = txRaw / norm;
+  const ty = tyRaw / norm;
+  const nx = -ty;
+  const ny = tx;
+  const yaw = Math.atan2(ty, tx);
+
+  return {
+    x: x + laneOffset * nx,
+    y: y + laneOffset * ny,
+    yaw,
+    tx,
+    ty,
+    nx,
+    ny,
+  };
+}
+
+function getRadius(p) {
+  if (p?.routeMode === 'imported') {
+    return Infinity;
+  }
+  const ts = TURN_SCENARIOS[p?.turnScenario];
+  if (ts && Number.isFinite(ts.radius)) return ts.radius;
+  const r = p?.curvRadius;
+  return finite(r, 0) > 0 ? finite(r, 0) : Infinity;
+}
+
+function getK(p, sCoord = 0) {
+  if (p?.routeMode === 'imported' && p?.importedRoute?.points?.length > 2) {
+    return routeCurvatureAtS(p.importedRoute, sCoord);
+  }
+
+  const ts = TURN_SCENARIOS[p?.turnScenario];
+  if (ts && ts.type !== 'straight' && Number.isFinite(ts.radius)) {
+    const sign = ts.angle >= 0 ? 1 : -1;
+    const turnLength = Math.max(18, Math.abs(ts.angle) * Math.PI / 180 * ts.radius);
+    if (sCoord >= 18 && sCoord <= 18 + turnLength) return sign / ts.radius;
+    return 0;
+  }
+
+  return 0;
+}
+
+
+function syntheticTurnPose(sCoord, d, p) {
+  const ts = TURN_SCENARIOS[p?.turnScenario];
+  if (!ts || ts.type === 'straight' || !Number.isFinite(ts.angle) || Math.abs(ts.angle) < 1e-9) {
+    return {
+      x: finite(sCoord, 0),
+      y: finite(d, 0),
+      yaw: 0,
+      tx: 1,
+      ty: 0,
+      nx: 0,
+      ny: 1,
+    };
+  }
+
+  const angle = ts.angle * Math.PI / 180;
+  const radius = Math.max(5, finite(ts.radius, 30));
+  const sign = angle >= 0 ? 1 : -1;
+  const turnStart = 18;
+  const turnLength = Math.abs(angle) * radius;
+  const turnEnd = turnStart + turnLength;
+  const s = finite(sCoord, 0);
+  const lateral = finite(d, 0);
+
+  if (s <= turnStart) {
+    return {
+      x: s,
+      y: lateral,
+      yaw: 0,
+      tx: 1,
+      ty: 0,
+      nx: 0,
+      ny: 1,
+    };
+  }
+
+  // Arc segment.
+  const k = sign / radius;
+  const phi = clamp((s - turnStart) * k, 0, angle);
+  const xCenterline = Math.sin(phi) / k;
+  const yCenterline = (1 - Math.cos(phi)) / k;
+  const tx = Math.cos(phi);
+  const ty = Math.sin(phi);
+  const nx = -Math.sin(phi);
+  const ny = Math.cos(phi);
+
+  if (s <= turnEnd) {
+    return {
+      x: turnStart + xCenterline + lateral * nx,
+      y: yCenterline + lateral * ny,
+      yaw: phi,
+      tx,
+      ty,
+      nx,
+      ny,
+    };
+  }
+
+  // Post-turn straight section, preserving final position and final heading.
+  const finalPhi = angle;
+  const finalX = turnStart + Math.sin(finalPhi) / k;
+  const finalY = (1 - Math.cos(finalPhi)) / k;
+  const extra = s - turnEnd;
+  const finalTx = Math.cos(finalPhi);
+  const finalTy = Math.sin(finalPhi);
+  const finalNx = -Math.sin(finalPhi);
+  const finalNy = Math.cos(finalPhi);
+
+  return {
+    x: finalX + extra * finalTx + lateral * finalNx,
+    y: finalY + extra * finalTy + lateral * finalNy,
+    yaw: finalPhi,
+    tx: finalTx,
+    ty: finalTy,
+    nx: finalNx,
+    ny: finalNy,
+  };
+}
+
+/** Frenet → world：可使用內建圓弧道路或匯入的真實 GeoJSON 道路中心線 */
+function roadPose(sCoord, d, p) {
+  if (p?.routeMode === 'imported' && p?.importedRoute?.points?.length > 1) {
+    return routePointAtS(p.importedRoute, sCoord, d);
+  }
+
+  return syntheticTurnPose(sCoord, d, p);
+}
+
+
+function routeTurnTarget(sCoord, p) {
+  const ts = TURN_SCENARIOS[p?.turnScenario];
+  if (!ts || ts.type === 'straight' || p?.routeMode === 'imported') return { laneCenter: 0, turnActive: false };
+
+  const turnStart = 18;
+  const turnLength = Math.max(18, Math.abs(ts.angle) * Math.PI / 180 * (ts.radius || 30));
+  const turnEnd = turnStart + turnLength;
+  const active = sCoord >= turnStart && sCoord <= turnEnd;
+
+  if (!active) return { laneCenter: 0, turnActive: false };
+
+  // 左轉時使用左側偏移、右轉使用右側偏移，讓畫面可清楚辨識路口工況。
+  const dir = ts.angle >= 0 ? 1 : -1;
+  const progress = clamp((sCoord - turnStart) / Math.max(1, turnLength), 0, 1);
+  const laneWidth = finite(p.laneWidth, roadWidthFor(p));
+
+  if (ts.type === 'intersection' || ts.type === 't_intersection') {
+    return {
+      laneCenter: dir * laneWidth * 0.35 * Math.sin(progress * Math.PI),
+      turnActive: true,
+    };
+  }
+
+  return {
+    laneCenter: dir * laneWidth * 0.18 * Math.sin(progress * Math.PI),
+    turnActive: true,
+  };
+}
+
+function controllerLFS(state, p, laneCenter = 0) {
+  const e = state.egoD - laneCenter;
+  const desiredYaw = roadPose(state.egoS, laneCenter, p).yaw;
+  const psi = normalizeAngle(state.egoYaw - desiredYaw);
+  const prevE = state.prevE;
+  const de = (e - prevE) / Math.max(state.dt, 0.001);
+
+  const delayBias = p.responseDelay > 0
+    ? clamp(state.steeringHistory.length > 2 ? state.steeringHistory[0] : state.steer, -0.08, 0.08)
+    : 0;
+
+  const raw = -(
+    finite(p.kp, 1.2) * e +
+    finite(p.kd, 0.25) * de +
+    finite(p.kpsi, 0.65) * psi +
+    delayBias
+  );
+
+  const noise = randn() * finite(p.steeringNoise, 0.02);
+  return clamp(raw + noise, -MAX_STEER, MAX_STEER);
+}
+
+function nearestTraffic(state, laneCenter, p) {
+  let best = null;
+  state.traffic.forEach((v) => {
+    if (v.lane !== laneCenter && Math.abs(v.d - laneCenter) > 0.6) return;
+    const ds = v.s - state.egoS;
+    if (ds > 0 && (!best || ds < best.gap)) {
+      best = {
+        id: v.id,
+        gap: ds,
+        speed: v.speed,
+        d: v.d,
+      };
+    }
+  });
+
+  if (p.hasLead) {
+    const leadGap = state.leadS - state.egoS;
+    if (leadGap > 0 && (!best || leadGap < best.gap)) {
+      best = {
+        id: 'TARGET',
+        gap: leadGap,
+        speed: state.leadV,
+        d: state.leadD,
+      };
+    }
+  }
+  return best;
+}
+
+function createTraffic(p) {
+  const count = weightedTrafficCount(p);
+  const lanes = Math.max(1, finite(p.laneCount, 2));
+  const width = finite(p.laneWidth, roadWidthFor(p));
+  const items = [];
+  for (let i = 0; i < count; i += 1) {
+    const laneIndex = Math.floor(Math.random() * lanes);
+    const center = (laneIndex - (lanes - 1) / 2) * width;
+    const ds = 25 + Math.random() * 180;
+    const speedBase = finite(p.egoSpeed, 60) * (0.55 + Math.random() * 0.45);
+    items.push({
+      id: `V${i + 1}`,
+      lane: laneIndex,
+      d: center,
+      s: ds,
+      speed: ms(Math.max(5, speedBase + randn() * 8)),
+    });
+  }
+  return items;
+}
+
+function makeState(p) {
+  const width = finite(p.laneWidth, roadWidthFor(p));
+  const ego = {
+    t: 0,
+    dt: CONTROL_DT,
+    egoS: 0,
+    egoD: finite(p.initialOffset, 0.3),
+    egoYaw: roadPose(0, finite(p.initialOffset, 0.3), p).yaw,
+    egoV: ms(finite(p.egoSpeed, 60)),
+    egoX: 0,
+    egoY: finite(p.initialOffset, 0.3),
+    steer: 0,
+    accel: 0,
+    prevE: finite(p.initialOffset, 0.3),
+    gap: finite(p.gapDist, 50),
+    leadS: finite(p.gapDist, 50),
+    leadD: 0,
+    leadV: ms(finite(p.leadSpeed, 40)),
+    leadX: finite(p.gapDist, 50),
+    leadY: 0,
+    aeb: 'OFF',
+    aebWarningTime: 0,
+    collision: false,
+    laneDeparture: false,
+    severeLaneDeparture: false,
+    minGap: finite(p.gapDist, 50),
+    maxAbsE: Math.abs(finite(p.initialOffset, 0.3)),
+    maxAbsPsi: 0,
+    warnings: 0,
+    nearMisses: 0,
+    traffic: createTraffic(p),
+    steeringHistory: [0, 0, 0, 0],
+    history: { t: [], v: [], gap: [], ttc: [], e: [] },
+    width,
+  };
+  ego.leadX = roadPose(ego.leadS, 0, p).x;
+  ego.leadY = roadPose(ego.leadS, 0, p).y;
+  ego.egoX = roadPose(0, ego.egoD, p).x;
+  ego.egoY = roadPose(0, ego.egoD, p).y;
+  return ego;
+}
+
+function dynamicDifficulty(p) {
+  const road = ROAD_TYPES[p.roadType] || ROAD_TYPES.h2;
+  const move = MOVES[p.maneuver] || MOVES.s1;
+  const laneCount = finite(p.laneCount, 2);
+  const laneFactor = laneCount === 1 ? 1.25 : laneCount === 2 ? 1.00 : 0.92;
+  const width = finite(p.laneWidth, roadWidthFor(p));
+  const widthFactor = clamp(road.baseWidth / Math.max(width, 2.2), 0.8, 1.6);
+  const trafficFactor = 0.85 + clamp(finite(p.trafficDensity, 50) / 100, 0, 1) * 0.75;
+  return road.difficulty * move.difficulty * laneFactor * widthFactor * trafficFactor;
+}
+
+function updateTraffic(s, p, dt) {
+  s.traffic.forEach((v) => {
+    const accelVariation = randn() * 0.15;
+    v.speed = clamp(v.speed + accelVariation * dt, ms(5), ms(130));
+    v.s += v.speed * dt;
+    if (v.s > s.egoS + 300) {
+      v.s = s.egoS + 120 + Math.random() * 180;
+      v.speed = ms(finite(p.egoSpeed, 60) * (0.55 + Math.random() * 0.4));
+    }
+  });
+}
+
+function updateLFS(s, p, dt) {
+  s.dt = dt;
+
+  let targetLane = routeTurnTarget(s.egoS, p).laneCenter;
+
+  // 保留原本 S4 左轉邏輯，並與新的角度工況相容。
+  if (p.maneuver === 's4' && !routeTurnTarget(s.egoS, p).turnActive) {
+    const turnStart = 55;
+    const turnProgress = clamp((s.egoS % 140) / turnStart, 0, 1);
+    targetLane = -finite(p.laneWidth, 3.5) * Math.min(1, turnProgress) * 0.5;
+  }
+
+  const steering = controllerLFS(s, p, targetLane);
+  s.steer = steering;
+  s.steeringHistory.unshift(steering);
+  if (s.steeringHistory.length > 6) s.steeringHistory.pop();
+
+  const e = s.egoD - targetLane;
+  const desiredYaw = roadPose(s.egoS, targetLane, p).yaw;
+  const psi = normalizeAngle(s.egoYaw - desiredYaw);
+
+  const v = Math.max(s.egoV, 0.1);
+  const k = getK(p);
+  const denominator = Math.max(0.2, 1 - k * s.egoD);
+  const sDot = v * Math.cos(psi) / denominator;
+  const dDot = v * Math.sin(psi);
+  const psiDot = (v / WHEELBASE) * Math.tan(s.steer) - k * sDot;
+
+  s.egoS += sDot * dt;
+  s.egoD += dDot * dt;
+  s.egoYaw = normalizeAngle(s.egoYaw + psiDot * dt);
+
+  const pose = roadPose(s.egoS, s.egoD, p);
+  s.egoX = pose.x;
+  s.egoY = pose.y;
+  s.maxAbsE = Math.max(s.maxAbsE, Math.abs(e));
+  s.maxAbsPsi = Math.max(s.maxAbsPsi, Math.abs(psi));
+  s.prevE = e;
+}
+
+function updateAEB(s, p, dt) {
+  updateTraffic(s, p, dt);
+
+  s.leadS += s.leadV * dt;
+  const leadPose = roadPose(s.leadS, s.leadD, p);
+  s.leadX = leadPose.x;
+  s.leadY = leadPose.y;
+
+  const target = nearestTraffic(s, 0, p);
+  if (!target) {
+    s.aeb = 'OFF';
+    const roadLimit = ROAD_TYPES[p.roadType]?.speedLimit || 60;
+    const targetSpeed = ms(Math.min(finite(p.egoSpeed, 60), roadLimit));
+    s.accel = clamp((targetSpeed - s.egoV) * 0.8, -2.5, 1.5);
+    s.egoV = Math.max(0, s.egoV + s.accel * dt);
+    return;
+  }
+
+  s.gap = target.gap;
+  const closing = s.egoV - target.speed;
+  const sensorNoise = randn() * finite(p.sensorNoise, 0.03);
+  const measuredGap = Math.max(0.5, s.gap + sensorNoise * 5);
+  const measuredClosing = closing + sensorNoise * 1.5;
+  const ttc = measuredClosing > 0 && measuredGap > 0 ? measuredGap / measuredClosing : Infinity;
+
+  const ttcThreshold = finite(p.ttcThreshold, 2.2);
+  const distThreshold = finite(p.distThreshold, 15);
+  const maxDecel = finite(p.maxDecel, 8);
+
+  if (s.aeb === 'OFF' && (ttc <= ttcThreshold || measuredGap <= distThreshold)) {
+    s.aeb = 'WARNING';
+    s.aebWarningTime = 0;
+    s.warnings += 1;
+  }
+
+  if (s.aeb === 'WARNING') {
+    s.aebWarningTime += dt;
+    if (s.aebWarningTime >= Math.max(0.05, finite(p.aebReactionDelay, 0.20))) {
+      s.aeb = 'BRAKING';
+    }
+  }
+
+  if (s.aeb === 'BRAKING') {
+    s.accel = -maxDecel;
+    s.egoV = Math.max(0, s.egoV + s.accel * dt);
+    if (s.egoV <= target.speed && measuredGap > 4) {
+      s.accel = 0;
+      s.egoV = target.speed;
+      s.aeb = 'OFF';
+    }
+  } else {
+    const nominal = ms(Math.min(finite(p.egoSpeed, 60), ROAD_TYPES[p.roadType]?.speedLimit || 60));
+    const followTarget = Math.min(nominal, target.speed + 10);
+    s.accel = clamp((followTarget - s.egoV) * 0.75, -2.5, 1.3);
+    s.egoV = Math.max(0, s.egoV + s.accel * dt);
+  }
+
+  if (measuredGap < 1.8) {
+    s.collision = true;
+    s.aeb = 'STOPPED';
+    s.egoV = 0;
+    s.accel = 0;
+  } else if (measuredGap < 4.0 && closing > 0) {
+    s.nearMisses += 1;
+  }
+
+  s.minGap = Math.min(s.minGap, measuredGap);
+}
+
+function applyLaneRisk(s, p) {
+  const laneWidth = finite(p.laneWidth, roadWidthFor(p));
+  const laneCount = Math.max(1, finite(p.laneCount, 2));
+  const boundary = safeLaneBoundary(laneWidth, laneCount);
+  const absD = Math.abs(s.egoD);
+  const diff = dynamicDifficulty(p);
+
+  if (absD > boundary) {
+    s.laneDeparture = true;
+    if (absD > boundary + 0.55 / diff) s.severeLaneDeparture = true;
+  }
+}
+
+function simulationStep(s, p, dt) {
+  s.t += dt;
+  updateLFS(s, p, dt);
+  updateAEB(s, p, dt);
+  applyLaneRisk(s, p);
+
+  const nearest = nearestTraffic(s, 0, p);
+  const closing = nearest ? s.egoV - nearest.speed : 0;
+  const gap = nearest ? nearest.gap : Infinity;
+  const ttc = nearest && closing > 0 && gap > 0 ? gap / closing : Infinity;
+
+  s.history.t.push(s.t);
+  s.history.v.push(kmh(s.egoV));
+  s.history.gap.push(Number.isFinite(gap) ? gap : NaN);
+  s.history.ttc.push(Number.isFinite(ttc) ? ttc : NaN);
+  s.history.e.push(s.egoD);
+
+  const cut = s.t - HISTORY_SECONDS;
+  while (s.history.t.length && s.history.t[0] < cut) {
+    s.history.t.shift();
+    s.history.v.shift();
+    s.history.gap.shift();
+    s.history.ttc.shift();
+    s.history.e.shift();
+  }
+}
+
+function runSingleTrial(inputParams, duration = 30) {
+  const p = { ...inputParams };
+  const road = ROAD_TYPES[p.roadType] || ROAD_TYPES.h2;
+
+  // Monte-Carlo：每次試跑加入不同初始狀態。
+  const scenario = {
+    ...p,
+    egoSpeed: clamp(finite(p.egoSpeed, 60) + randn() * finite(p.speedJitter, 4), 5, 180),
+    leadSpeed: clamp(finite(p.leadSpeed, 40) + randn() * finite(p.speedJitter, 4), 0, 180),
+    gapDist: clamp(finite(p.gapDist, 50) + randn() * finite(p.gapJitter, 7), 6, 180),
+    initialOffset: clamp(finite(p.initialOffset, 0.3) + randn() * finite(p.offsetJitter, 0.15), -1.5, 1.5),
+    steeringNoise: finite(p.steeringNoise, 0.02) * (1 + Math.random() * 0.8),
+    sensorNoise: finite(p.sensorNoise, 0.03) * (1 + Math.random() * 0.8),
+  };
+
+  // 路型與窄道造成控制困難。
+  scenario.steeringNoise *= dynamicDifficulty(scenario);
+  scenario.sensorNoise *= 0.85 + dynamicDifficulty(scenario) * 0.15;
+
+  const s = makeState(scenario);
+  const maxRouteS = scenario.routeMode === 'imported' && scenario.importedRoute?.length
+    ? scenario.importedRoute.length
+    : Infinity;
+  const steps = Math.ceil(duration / CONTROL_DT);
+
+  for (let i = 0; i < steps; i += 1) {
+    simulationStep(s, scenario, CONTROL_DT);
+    if (s.egoS >= maxRouteS - 1) {
+      // 到達匯入道路線段末端：視為完成此段路徑，不直接判事故。
+      s.runningFinished = true;
+      break;
+    }
+    if (s.collision) break;
+    if (s.severeLaneDeparture && s.aeb === 'OFF' && s.t > 4) {
+      // 只有持續偏離才提前結束，避免一次瞬間尖峰直接判為事故。
+      if (Math.abs(s.egoD) > safeLaneBoundary(scenario.laneWidth, scenario.laneCount) + 0.9) break;
+    }
+  }
+
+  const laneBoundary = safeLaneBoundary(scenario.laneWidth, scenario.laneCount);
+  const diff = dynamicDifficulty(scenario);
+
+  // 事故判定：
+  // A. 真實模擬追撞；
+  // B. 嚴重車道偏離；
+  // C. 高難度情境下，長時間超出道路有效範圍。
+  const offRoadSeconds = Math.abs(s.egoD) > laneBoundary ? 0.8 : 0;
+  const roadEscape = Math.abs(s.egoD) > laneBoundary + 1.1;
+  const accident = Boolean(s.collision || s.severeLaneDeparture || roadEscape || (offRoadSeconds > 2 && diff > 1.45));
+
+  return {
+    accident,
+    collision: s.collision,
+    laneDeparture: s.laneDeparture,
+    severeLaneDeparture: s.severeLaneDeparture,
+    minGap: s.minGap,
+    maxAbsE: s.maxAbsE,
+    maxAbsPsi: s.maxAbsPsi,
+    nearMisses: s.nearMisses,
+    warnings: s.warnings,
+    finalSpeed: kmh(s.egoV),
+    finalGap: s.gap,
+    aebState: s.aeb,
+    difficulty: diff,
+  };
+}
+
+function runMonteCarlo(p, trials) {
+  const results = [];
+  for (let i = 0; i < trials; i += 1) {
+    results.push(runSingleTrial(p, finite(p.mcDuration, 30)));
+  }
+
+  const sum = (key) => results.reduce((a, b) => a + (Number(b[key]) || 0), 0);
+  const accidents = results.filter((r) => r.accident).length;
+  const collisions = results.filter((r) => r.collision).length;
+  const laneDepartures = results.filter((r) => r.severeLaneDeparture).length;
+
+  return {
+    trials,
+    accidents,
+    collisions,
+    laneDepartures,
+    accidentRate: accidents / Math.max(1, trials),
+    collisionRate: collisions / Math.max(1, trials),
+    laneDepartureRate: laneDepartures / Math.max(1, trials),
+    avgMinGap: sum('minGap') / Math.max(1, trials),
+    avgMaxE: sum('maxAbsE') / Math.max(1, trials),
+    avgMaxPsi: sum('maxAbsPsi') / Math.max(1, trials),
+    avgNearMisses: sum('nearMisses') / Math.max(1, trials),
+    avgWarnings: sum('warnings') / Math.max(1, trials),
+    difficulty: results.length ? results[0].difficulty : 0,
+    raw: results,
+  };
+}
+
+function drawChart(canvasRef, data, label, minY, maxY) {
+  const canvas = canvasRef.current;
+  if (!canvas) return;
+  const g = canvas.getContext('2d');
+  if (!g) return;
+  const width = canvas.width;
+  const height = canvas.height;
+  g.clearRect(0, 0, width, height);
+
+  const pad = { l: 34, r: 8, t: 8, b: 22 };
+  const plotWidth = width - pad.l - pad.r;
+  const plotHeight = height - pad.t - pad.b;
+
+  g.strokeStyle = '#d8dee3';
+  g.lineWidth = 1;
+  for (let i = 0; i < 4; i += 1) {
+    const y = pad.t + plotHeight * i / 3;
+    g.beginPath();
+    g.moveTo(pad.l, y);
+    g.lineTo(width - pad.r, y);
+    g.stroke();
+  }
+
+  if (data.length >= 2) {
+    g.strokeStyle = '#1769aa';
+    g.lineWidth = 2;
+    g.beginPath();
+    let started = false;
+    data.forEach((value, index) => {
+      if (!Number.isFinite(value)) {
+        started = false;
+        return;
+      }
+      const px = pad.l + plotWidth * index / (data.length - 1);
+      const py = pad.t + plotHeight * (1 - clamp((value - minY) / Math.max(0.0001, maxY - minY), 0, 1));
+      if (!started) {
+        g.moveTo(px, py);
+        started = true;
+      } else {
+        g.lineTo(px, py);
+      }
+    });
+    g.stroke();
+  }
+
+  g.fillStyle = '#65727c';
+  g.font = '10px Arial';
+  g.fillText(maxY.toFixed(0), 3, pad.t + 9);
+  g.fillText(minY.toFixed(0), 3, height - pad.b);
+  g.fillText(label, width - 35, height - 5);
+}
+
+function drawScene(canvasRef, p, s) {
+  const canvas = canvasRef.current;
+  if (!canvas) return;
+  const g = canvas.getContext('2d');
+  if (!g) return;
+
+  const width = canvas.width;
+  const height = canvas.height;
+  g.clearRect(0, 0, width, height);
+
+  const laneWidth = finite(p.laneWidth, roadWidthFor(p));
+  const laneCount = Math.max(1, finite(p.laneCount, 2));
+  const roadHalf = laneWidth * laneCount / 2;
+  const scale = p.routeMode === 'imported'
+    ? clamp(500 / Math.max(80, p.importedRoute?.length || 200), 2.5, 10.0)
+    : 7.0;
+  const cx = width * 0.78;
+  const cy = 235;
+
+  g.fillStyle = '#3c7b45';
+  g.fillRect(0, 0, width, height);
+
+  g.fillStyle = '#4f585d';
+  g.fillRect(0, 65, width, 340);
+
+  // 道路以 s/d 座標繪製；匯入 GeoJSON 後，s 軸直接沿著真實道路中心線前進。
+  const lane = (offset, stroke, lw, dash) => {
+    g.beginPath();
+    const start = s.egoS - 100;
+    const end = p.routeMode === 'imported'
+      ? Math.min(s.egoS + 250, p.importedRoute?.length || s.egoS + 250)
+      : s.egoS + 250;
+    for (let i = 0; i <= 360; i += 1) {
+      const sc = start + (end - start) * i / 360;
+      const pose = roadPose(sc, offset, p);
+      const x = cx - (pose.x - s.egoX) * scale;
+      const y = cy + (pose.y - s.egoY) * scale;
+      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+    }
+    g.strokeStyle = stroke;
+    g.lineWidth = lw;
+    g.setLineDash(dash ? [28, 18] : []);
+    g.stroke();
+    g.setLineDash([]);
+  };
+
+  // 匯入道路先畫中心線，讓實際道路形狀清楚可見。
+  if (p.routeMode === 'imported' && p.importedRoute?.points?.length > 1) {
+    g.beginPath();
+    const pts = p.importedRoute.points;
+    pts.forEach((pt, i) => {
+      const x = cx - (pt.x - s.egoX) * scale;
+      const y = cy + (pt.y - s.egoY) * scale;
+      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+    });
+    g.strokeStyle = '#d5dbe0';
+    g.lineWidth = Math.max(3, laneWidth * scale);
+    g.lineCap = 'round';
+    g.stroke();
+  }
+
+  // 路口工況視覺化：90° / T intersection / U-turn 額外畫出交叉道路。
+  const ts = TURN_SCENARIOS[p?.turnScenario];
+  if (ts && (ts.type === 'intersection' || ts.type === 't_intersection' || ts.type === 'uturn')) {
+    g.save();
+    const armX = cx - 18;
+    const armY = cy;
+    g.strokeStyle = '#666f75';
+    g.lineWidth = Math.max(18, laneWidth * scale);
+    g.lineCap = 'butt';
+
+    if (Math.abs(ts.angle) === 90) {
+      g.beginPath();
+      g.moveTo(armX - 260, armY);
+      g.lineTo(armX + 120, armY);
+      g.moveTo(armX, armY - 170);
+      g.lineTo(armX, armY + 170);
+      g.stroke();
+
+      // 虛線中心
+      g.strokeStyle = '#ececec';
+      g.lineWidth = 2;
+      g.setLineDash([18, 12]);
+      g.beginPath();
+      g.moveTo(armX - 260, armY);
+      g.lineTo(armX + 120, armY);
+      g.moveTo(armX, armY - 170);
+      g.lineTo(armX, armY + 170);
+      g.stroke();
+      g.setLineDash([]);
+    } else if (ts.type === 'uturn') {
+      g.strokeStyle = '#666f75';
+      g.lineWidth = Math.max(18, laneWidth * scale);
+      g.beginPath();
+      g.arc(armX, armY, 110, Math.PI, 0, false);
+      g.stroke();
+    }
+    g.restore();
+  }
+
+  // 左右道路邊界與車道線
+  lane(-roadHalf, '#f7f7f7', 4, false);
+  lane(roadHalf, '#f7f7f7', 4, false);
+
+  // 車道分隔線
+  for (let i = 1; i < laneCount; i += 1) {
+    const d = -roadHalf + laneWidth * i;
+    lane(d, '#f2f2f2', 2.5, true);
+  }
+
+  const drawCar = (wx, wy, yaw, label, body) => {
+    const px = cx - (wx - s.egoX) * scale;
+    const py = cy + (wy - s.egoY) * scale;
+    const len = 4.5 * scale;
+    const wid = 1.8 * scale;
+
+    g.save();
+    g.translate(px, py);
+    g.rotate(-yaw);
+
+    g.fillStyle = body;
+    g.strokeStyle = '#fff';
+    g.lineWidth = 2;
+    g.beginPath();
+    g.rect(-len / 2, -wid / 2, len, wid);
+    g.fill();
+    g.stroke();
+
+    g.fillStyle = '#b9d4e3';
+    g.fillRect(-len * 0.1, -wid * 0.32, len * 0.4, wid * 0.64);
+    g.restore();
+
+    g.fillStyle = '#fff';
+    g.font = 'bold 13px Arial';
+    g.textAlign = 'center';
+    g.fillText(label, px, py - 22);
+    g.textAlign = 'left';
+  };
+
+  const egoPose = roadPose(s.egoS, s.egoD, p);
+  drawCar(egoPose.x, egoPose.y, egoPose.yaw, 'Ego', '#1769aa');
+
+  if (p.hasLead) {
+    const leadPose = roadPose(s.leadS, s.leadD, p);
+    drawCar(leadPose.x, leadPose.y, leadPose.yaw, 'Target', '#d64545');
+  }
+
+  s.traffic.slice(0, 8).forEach((v) => {
+    const pose = roadPose(v.s, v.d, p);
+    drawCar(pose.x, pose.y, pose.yaw, v.id, '#8d6ba8');
+  });
+
+  g.fillStyle = '#fff';
+  g.font = 'bold 17px Arial';
+  g.fillText(`道路：${ROAD_TYPES[p.roadType]?.label || p.roadType}`, 20, 28);
+  g.fillText(`工況：${TURN_SCENARIOS[p.turnScenario]?.label || MOVES[p.maneuver]?.label || p.maneuver}`, 20, 52);
+  g.fillText(`車道：${laneCount}｜單道寬：${laneWidth.toFixed(2)} m｜車流：${p.trafficDensity}%`, 20, 76);
+
+  g.fillStyle = '#ffd447';
+  g.font = 'bold 14px Arial';
+  g.fillText(`e = ${s.egoD.toFixed(2)} m`, 20, height - 58);
+  g.fillText(`轉向 = ${TURN_SCENARIOS[p.turnScenario]?.label || '—'}`, 20, height - 38);
+  g.fillText(`AEB = ${s.aeb}`, 20, height - 18);
+
+  if (s.collision) {
+    g.fillStyle = '#fff';
+    g.font = 'bold 28px Arial';
+    g.fillText('⚠ COLLISION', width * 0.42, 55);
+  }
+}
+
+function miniMetric(label, value, unit) {
+  return (
+    <div style={{
+      background: '#f2f6f8',
+      borderRadius: 10,
+      padding: 10,
+      textAlign: 'center',
+      minHeight: 72,
+    }}>
+      <div style={{ fontSize: 11, color: '#6c7780' }}>{label}</div>
+      <div style={{ fontSize: 19, fontWeight: 800, marginTop: 3 }}>{value}</div>
+      <div style={{ fontSize: 11, color: '#7a858c' }}>{unit}</div>
+    </div>
+  );
+}
+
+function ADASSimulator() {
+  const initialParams = {
+    routeMode: 'synthetic',
+    importedRoute: null,
+    importedRoadId: null,
+    roadType: 'h2',
+    maneuver: 's1',
+    turnScenario: 'straight',
+    turnAngle: 0,
+    laneCount: 2,
+    laneWidth: ROAD_TYPES.h2.baseWidth,
+    widthMode: 'standard',
+    customLaneWidth: ROAD_TYPES.h2.baseWidth,
+    trafficDensity: 50,
+    egoSpeed: 60,
+    leadSpeed: 40,
+    gapDist: 50,
+    curvRadius: 180,
+    turnDirection: 1,
+    initialOffset: 0.3,
+
+    kp: PRESETS.baseline.kp,
+    kd: PRESETS.baseline.kd,
+    kpsi: PRESETS.baseline.kpsi,
+
+    ttcThreshold: PRESETS.baseline.ttcThreshold,
+    distThreshold: PRESETS.baseline.distThreshold,
+    maxDecel: PRESETS.baseline.maxDecel,
+    aebReactionDelay: 0.20,
+
+    sensorNoise: PRESETS.baseline.sensorNoise,
+    steeringNoise: PRESETS.baseline.steeringNoise,
+    responseDelay: PRESETS.baseline.responseDelay,
+
+    hasLead: true,
+
+    mcTrials: 50,
+    mcDuration: 30,
+    speedJitter: 4,
+    gapJitter: 7,
+    offsetJitter: 0.15,
+    simRate: 1,
+  };
+
+  const [params, setParams] = useState(initialParams);
+  const paramsRef = useRef(initialParams);
+  const canvasRef = useRef(null);
+  const chartVRef = useRef(null);
+  const chartGRef = useRef(null);
+  const chartERef = useRef(null);
+  const rootRef = useRef(null);
+
+  const [state, setState] = useState(() => makeState(initialParams));
+  const stateRef = useRef(makeState(initialParams));
+  const [running, setRunning] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const runningRef = useRef(false);
+  const pausedRef = useRef(false);
+  const rafRef = useRef(null);
+  const [clock, setClock] = useState(new Date().toLocaleString('zh-TW'));
+  const [logs, setLogs] = useState([]);
+  const [simResult, setSimResult] = useState(null);
+  const [comparison, setComparison] = useState([]);
+  const [selectedPreset, setSelectedPreset] = useState('baseline');
+  const [roadCatalog, setRoadCatalog] = useState([]);
+  const [selectedRoadIndex, setSelectedRoadIndex] = useState(-1);
+  const [mapFileName, setMapFileName] = useState('');
+  const [mapError, setMapError] = useState('');
+
+  const applyRoadCatalogItem = (item, index) => {
+    if (!item) return;
+
+    const move = item.maneuver || 's1';
+
+    const next = {
+      ...paramsRef.current,
+      routeMode: 'imported',
+      importedRoute: item.route,
+      importedRoadId: item.id,
+      roadType: item.roadType,
+      laneCount: clamp(item.lanes, 1, 3),
+      laneWidth: item.laneWidth,
+      customLaneWidth: item.laneWidth,
+      widthMode: 'custom',
+      egoSpeed: Math.min(paramsRef.current.egoSpeed, item.speedLimit),
+      leadSpeed: Math.min(paramsRef.current.leadSpeed, item.speedLimit),
+      trafficDensity: item.trafficDensity,
+      curvRadius: item.route?.length ? Math.max(25, Math.min(5000, item.route.length / 6)) : paramsRef.current.curvRadius,
+      maneuver: move,
+      turnScenario: item.maneuver === 's1' ? 'straight' : item.maneuver === 's2' ? 'left45' : item.maneuver === 's4' ? 'left90' : 'right45',
+      turnAngle: item.maneuver === 's1' ? 0 : item.maneuver === 's4' ? 90 : item.maneuver === 's2' ? 45 : -45,
+      turnDirection: item.maneuver === 's3' ? -1 : 1,
+    };
+
+    paramsRef.current = next;
+    setParams(next);
+    setSelectedRoadIndex(index);
+    setMapError('');
+    reset(next, true);
+  };
+
+  const handleGeoJSONText = (text, fileName = 'GeoJSON') => {
+    try {
+      const geojson = JSON.parse(text);
+      const catalog = buildGeoJSONRoadCatalog(geojson);
+
+      if (!catalog.length) {
+        throw new Error('沒有找到可用的 LineString / MultiLineString 道路。');
+      }
+
+      setRoadCatalog(catalog);
+      setSelectedRoadIndex(0);
+      setMapFileName(fileName);
+      setMapError('');
+
+      const first = catalog[0];
+      const next = {
+        ...paramsRef.current,
+        routeMode: 'imported',
+        importedRoute: first.route,
+        importedRoadId: first.id,
+        roadType: first.roadType,
+        laneCount: clamp(first.lanes, 1, 3),
+        laneWidth: first.laneWidth,
+        customLaneWidth: first.laneWidth,
+        widthMode: 'custom',
+        egoSpeed: Math.min(paramsRef.current.egoSpeed, first.speedLimit),
+        leadSpeed: Math.min(paramsRef.current.leadSpeed, first.speedLimit),
+        trafficDensity: first.trafficDensity,
+        curvRadius: first.route?.length ? Math.max(25, Math.min(5000, first.route.length / 6)) : paramsRef.current.curvRadius,
+        maneuver: first.maneuver || 's1',
+        turnScenario: first.maneuver === 's1' ? 'straight' : first.maneuver === 's2' ? 'left45' : first.maneuver === 's4' ? 'left90' : 'right45',
+        turnAngle: first.maneuver === 's1' ? 0 : first.maneuver === 's4' ? 90 : first.maneuver === 's2' ? 45 : -45,
+        turnDirection: first.maneuver === 's3' ? -1 : 1,
+      };
+      paramsRef.current = next;
+      setParams(next);
+      reset(next, true);
+    } catch (err) {
+      setMapError(`GeoJSON 匯入失敗：${err?.message || String(err)}`);
+    }
+  };
+
+  const handleGeoJSONFile = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => handleGeoJSONText(String(e.target?.result || ''), file.name);
+    reader.onerror = () => setMapError('檔案讀取失敗。');
+    reader.readAsText(file);
+  };
+
+  const clearImportedRoad = () => {
+    const next = {
+      ...paramsRef.current,
+      routeMode: 'synthetic',
+      importedRoute: null,
+      importedRoadId: null,
+    };
+    paramsRef.current = next;
+    setParams(next);
+    setRoadCatalog([]);
+    setSelectedRoadIndex(-1);
+    setMapFileName('');
+    setMapError('');
+    reset(next, true);
+  };
+
+  const setParam = (key) => (value) => {
+    const nextValue = value === null || value === undefined ? 0 : value;
+    const next = { ...paramsRef.current, [key]: nextValue };
+    paramsRef.current = next;
+    setParams(next);
+  };
+
+  const reset = (pArg = paramsRef.current, writeLog = true) => {
+    const view = rootRef.current?.ownerDocument?.defaultView;
+    if (rafRef.current != null) {
+      if (view?.clearTimeout) view.clearTimeout(rafRef.current);
+      rafRef.current = null;
+    }
+
+    runningRef.current = false;
+    pausedRef.current = false;
+
+    const nextState = makeState(pArg);
+    stateRef.current = nextState;
+    setState({ ...nextState });
+    setRunning(false);
+    setPaused(false);
+    setSimResult(null);
+
+    if (writeLog) {
+      setLogs((prev) => [
+        `[RESET] ${ROAD_TYPES[pArg.roadType]?.label} / ${MOVES[pArg.maneuver]?.label}`,
+        ...prev,
+      ].slice(0, 80));
+    }
+
+    // 立即畫出初始場景，避免 AU Hub / iframe 尚未觸發下一次 render 時畫布空白。
+    const drawNow = () => {
+      drawScene(canvasRef, pArg, nextState);
+      drawChart(chartVRef, [], 'V', 0, Math.max(80, finite(pArg.egoSpeed, 60) + 20));
+      drawChart(chartGRef, [], 'G', 0, Math.max(60, finite(pArg.gapDist, 50) + 10));
+      drawChart(chartERef, [], 'E', -2, 2);
+    };
+
+    if (view?.requestAnimationFrame) view.requestAnimationFrame(drawNow);
+    else drawNow();
+  };
+
+  // V3_2：恢復慶齡版的 host-aware requestAnimationFrame + real-dt 動畫核心。
+  const getHostView = () => rootRef.current?.ownerDocument?.defaultView || (typeof window !== 'undefined' ? window : null);
+
+  const getNow = () => {
+    const view = getHostView();
+    return view?.performance && typeof view.performance.now === 'function'
+      ? view.performance.now()
+      : Date.now();
+  };
+
+  const scheduleFrame = (callback, delay = 20) => {
+    const view = getHostView();
+    if (view && typeof view.requestAnimationFrame === 'function') {
+      return { type: 'raf', value: view.requestAnimationFrame(callback) };
+    }
+    if (view && typeof view.setTimeout === 'function') {
+      return { type: 'timeout', value: view.setTimeout(() => callback(getNow()), delay) };
+    }
+    return { type: 'timeout', value: setTimeout(() => callback(getNow()), delay) };
+  };
+
+  const cancelScheduledFrame = () => {
+    const view = getHostView();
+    const handle = rafRef.current;
+    if (handle == null) return;
+    if (handle.type === 'raf') {
+      view?.cancelAnimationFrame?.(handle.value);
+    } else if (handle.type === 'timeout') {
+      view?.clearTimeout?.(handle.value);
+    }
+    rafRef.current = null;
+  };
+
+  const renderLiveFrame = (p, s) => {
+    setState({ ...s });
+    drawScene(canvasRef, p, s);
+    drawChart(chartVRef, s.history.v, 'V', 0, Math.max(80, finite(p.egoSpeed, 60) + 20));
+    drawChart(chartGRef, s.history.gap, 'G', 0, Math.max(60, finite(p.gapDist, 50) + 10));
+    drawChart(chartERef, s.history.e, 'E', -2, 2);
+  };
+
+  const runLive = () => {
+    const p = { ...paramsRef.current };
+    cancelScheduledFrame();
+
+    const s = makeState(p);
+    stateRef.current = s;
+    setState({ ...s });
+    runningRef.current = true;
+    pausedRef.current = false;
+    setRunning(true);
+    setPaused(false);
+    s.lastTs = getNow();
+
+    setLogs((prev) => [
+      `[START] ▶ 即時動畫：${ROAD_TYPES[p.roadType]?.label} / ${TURN_SCENARIOS[p.turnScenario]?.label || MOVES[p.maneuver]?.label}`,
+      ...prev,
+    ].slice(0, 80));
+
+    renderLiveFrame(p, s);
+
+    const frame = (timestamp) => {
+      if (!runningRef.current || pausedRef.current) {
+        rafRef.current = null;
+        return;
+      }
+
+      // 與慶齡版一致：以實際經過時間驅動模擬，再切成 20 ms 控制步階。
+      let realDt = clamp((timestamp - s.lastTs) / 1000, 0, 0.05);
+      s.lastTs = timestamp;
+      realDt *= Math.max(0, finite(p.simRate, 1));
+
+      let remain = realDt;
+      while (remain > 0 && runningRef.current && !pausedRef.current) {
+        const h = Math.min(CONTROL_DT, remain);
+        simulationStep(s, p, h);
+        remain -= h;
+      }
+
+      renderLiveFrame(p, s);
+
+      const laneLimit = safeLaneBoundary(p.laneWidth, p.laneCount);
+      let shouldStop = false;
+      let stopMessage = '';
+      if (s.collision) {
+        shouldStop = true;
+        stopMessage = `[${s.t.toFixed(2)}s] ⚠ 發生模擬追撞`;
+      } else if (Math.abs(s.egoD) > laneLimit + 1.0 && s.t > 3) {
+        shouldStop = true;
+        stopMessage = `[${s.t.toFixed(2)}s] ⚠ Ego 嚴重偏離有效道路範圍`;
+      } else if (p.routeMode === 'imported' && p.importedRoute?.length && s.egoS >= p.importedRoute.length - 1) {
+        shouldStop = true;
+        stopMessage = `[${s.t.toFixed(2)}s] ✓ 已到達匯入道路終點`;
+      } else if (s.t >= finite(p.mcDuration, 30)) {
+        const restart = makeState(p);
+        restart.lastTs = getNow();
+        stateRef.current = restart;
+        renderLiveFrame(p, restart);
+        setLogs((prev) => [`[LOOP] ⟳ 已完成 ${p.mcDuration}s，重新從起點播放`, ...prev].slice(0, 80));
+      }
+
+      if (shouldStop) {
+        runningRef.current = false;
+        pausedRef.current = false;
+        rafRef.current = null;
+        setRunning(false);
+        setPaused(false);
+        if (stopMessage) setLogs((prev) => [stopMessage, ...prev].slice(0, 80));
+        return;
+      }
+      rafRef.current = scheduleFrame(frame, 20);
+    };
+
+    rafRef.current = scheduleFrame(frame, 20);
+  };
+
+  const togglePause = () => {
+    if (!runningRef.current) return;
+
+    if (!pausedRef.current) {
+      pausedRef.current = true;
+      setPaused(true);
+      cancelScheduledFrame();
+      setLogs((prev) => [`[PAUSE] Ⅱ 即時動畫暫停`, ...prev].slice(0, 80));
+      return;
+    }
+
+    pausedRef.current = false;
+    setPaused(false);
+    const p = { ...paramsRef.current };
+    const s = stateRef.current;
+    s.lastTs = getNow();
+    setLogs((prev) => [`[RESUME] ▶ 即時動畫繼續`, ...prev].slice(0, 80));
+
+    const frame = (timestamp) => {
+      if (!runningRef.current || pausedRef.current) {
+        rafRef.current = null;
+        return;
+      }
+      let realDt = clamp((timestamp - s.lastTs) / 1000, 0, 0.05);
+      s.lastTs = timestamp;
+      realDt *= Math.max(0, finite(p.simRate, 1));
+      let remain = realDt;
+      while (remain > 0 && runningRef.current && !pausedRef.current) {
+        const h = Math.min(CONTROL_DT, remain);
+        simulationStep(s, p, h);
+        remain -= h;
+      }
+      renderLiveFrame(p, s);
+      if (s.collision) {
+        runningRef.current = false;
+        pausedRef.current = false;
+        setRunning(false);
+        setPaused(false);
+        rafRef.current = null;
+        setLogs((prev) => [`[${s.t.toFixed(2)}s] ⚠ 發生模擬追撞`, ...prev].slice(0, 80));
+        return;
+      }
+      rafRef.current = scheduleFrame(frame, 20);
+    };
+    rafRef.current = scheduleFrame(frame, 20);
+  };
+
+  // 只負責處理視窗尺寸 / 時鐘；即時模擬本身由 runLive 的 ref-loop 控制。
+  useEffect(() => {
+    const view = rootRef.current?.ownerDocument?.defaultView;
+    let timer = null;
+    if (view?.setInterval) {
+      timer = view.setInterval(() => {
+        setClock(new Date().toLocaleString('zh-TW'));
+      }, 1000);
+    }
+
+    // 初始化 Canvas。
+    const init = () => {
+      const p = paramsRef.current;
+      const s = stateRef.current;
+      drawScene(canvasRef, p, s);
+      drawChart(chartVRef, s.history.v, 'V', 0, Math.max(80, finite(p.egoSpeed, 60) + 20));
+      drawChart(chartGRef, s.history.gap, 'G', 0, Math.max(60, finite(p.gapDist, 50) + 10));
+      drawChart(chartERef, s.history.e, 'E', -2, 2);
+    };
+
+    if (view?.requestAnimationFrame) view.requestAnimationFrame(init);
+    else init();
+
+    return () => {
+      if (view?.clearInterval && timer) view.clearInterval(timer);
+      if (rafRef.current != null) {
+        if (view?.clearTimeout) view.clearTimeout(rafRef.current);
+        rafRef.current = null;
+      }
+      runningRef.current = false;
+      pausedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    paramsRef.current = params;
+    if (!runningRef.current) {
+      // 參數變更後，立即預覽靜態道路場景。
+      const view = rootRef.current?.ownerDocument?.defaultView;
+      const draw = () => drawScene(canvasRef, params, stateRef.current);
+      if (view?.requestAnimationFrame) view.requestAnimationFrame(draw);
+      else draw();
+    }
+  }, [params]);
+
+
+  const applyPreset = (name) => {
+    const preset = PRESETS[name];
+    if (!preset) return;
+    const next = { ...paramsRef.current, ...preset };
+    paramsRef.current = next;
+    setParams(next);
+    setSelectedPreset(name);
+    setLogs((prev) => [`[PARAM] 套用 ${preset.name}`, ...prev].slice(0, 80));
+  };
+
+  const executeMonteCarlo = (labelOverride) => {
+    const p = { ...paramsRef.current };
+    const result = runMonteCarlo(p, finite(p.mcTrials, 50));
+    const label = labelOverride || `${selectedPreset.toUpperCase()} / ${ROAD_TYPES[p.roadType]?.label || p.roadType} / ${MOVES[p.maneuver]?.label || p.maneuver}`;
+
+    const row = {
+      id: `${Date.now()}-${Math.random()}`,
+      label,
+      preset: selectedPreset,
+      road: ROAD_TYPES[p.roadType]?.label || p.roadType,
+      move: MOVES[p.maneuver]?.label || p.maneuver,
+      lanes: p.laneCount,
+      width: finite(p.laneWidth, roadWidthFor(p)),
+      traffic: p.trafficDensity,
+      kp: p.kp,
+      kd: p.kd,
+      kpsi: p.kpsi,
+      accidentRate: result.accidentRate,
+      collisionRate: result.collisionRate,
+      laneDepartureRate: result.laneDepartureRate,
+      avgMinGap: result.avgMinGap,
+      avgMaxE: result.avgMaxE,
+      avgNearMisses: result.avgNearMisses,
+      trials: result.trials,
+      result,
+    };
+
+    setSimResult(result);
+    setComparison((prev) => [row, ...prev].slice(0, 12));
+    setLogs((prev) => [
+      `[MC] ${label} → Accident ${(result.accidentRate * 100).toFixed(1)}% / Collision ${(result.collisionRate * 100).toFixed(1)}%`,
+      ...prev,
+    ].slice(0, 80));
+  };
+
+  const addCurrentVersion = () => {
+    const name = `Custom ${comparison.length + 1}`;
+    executeMonteCarlo(name);
+  };
+
+  const batchCompare = () => {
+    const p = paramsRef.current;
+    const versions = [
+      { key: 'baseline', ...PRESETS.baseline },
+      { key: 'soft', ...PRESETS.soft },
+      { key: 'aggressive', ...PRESETS.aggressive },
+    ];
+
+    const rows = versions.map((v) => {
+      const pp = { ...p, ...v };
+      const result = runMonteCarlo(pp, finite(pp.mcTrials, 50));
+      return {
+        id: `${Date.now()}-${v.key}-${Math.random()}`,
+        label: v.name,
+        preset: v.key,
+        road: ROAD_TYPES[p.roadType]?.label || p.roadType,
+        move: MOVES[p.maneuver]?.label || p.maneuver,
+        lanes: p.laneCount,
+        width: finite(p.laneWidth, roadWidthFor(p)),
+        traffic: p.trafficDensity,
+        kp: v.kp,
+        kd: v.kd,
+        kpsi: v.kpsi,
+        accidentRate: result.accidentRate,
+        collisionRate: result.collisionRate,
+        laneDepartureRate: result.laneDepartureRate,
+        avgMinGap: result.avgMinGap,
+        avgMaxE: result.avgMaxE,
+        avgNearMisses: result.avgNearMisses,
+        trials: result.trials,
+        result,
+      };
+    });
+
+    setComparison(rows);
+    setSimResult(rows[0]?.result || null);
+    setLogs((prev) => [
+      `[BATCH] 已完成 ${rows.length} 個 ADAS 版本比較`,
+      ...prev,
+    ].slice(0, 80));
+  };
+
+  const clearComparison = () => {
+    setComparison([]);
+    setSimResult(null);
+  };
+
+
+  const summaryText = useMemo(() => {
+    const road = ROAD_TYPES[params.roadType];
+    const move = MOVES[params.maneuver];
+    const width = params.widthMode === 'custom' ? params.customLaneWidth : roadWidthFor(params);
+    const diff = dynamicDifficulty({ ...params, laneWidth: width });
+
+    return {
+      road: road?.label || params.roadType,
+      move: move?.label || params.maneuver,
+      routeMode: params.routeMode,
+      width,
+      difficulty: diff,
+    };
+  }, [params]);
+
+  const styles = useMemo(() => ({
+    app: {
+      maxWidth: 1600,
+      margin: '0 auto',
+      padding: 14,
+      background: '#edf2f6',
+      color: '#17202a',
+      fontFamily: 'Microsoft JhengHei, Segoe UI, Arial, sans-serif',
+    },
+    header: {
+      background: 'linear-gradient(135deg,#153b59,#1e587f)',
+      color: '#fff',
+      padding: '20px 26px',
+      borderRadius: 14,
+      display: 'flex',
+      justifyContent: 'space-between',
+      gap: 20,
+      flexWrap: 'wrap',
+    },
+    title: { margin: 0, fontSize: 24, color: '#fff', fontWeight: 800 },
+    subtitle: { margin: '6px 0 0', fontSize: 13, opacity: 0.88, maxWidth: 1000 },
+    panel: {
+      background: '#fff',
+      borderRadius: 12,
+      marginTop: 12,
+      padding: 16,
+      boxShadow: '0 3px 15px #00000012',
+    },
+    sectionTitle: {
+      fontSize: 17,
+      fontWeight: 800,
+      marginBottom: 13,
+      color: '#183e5c',
+    },
+    grid: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+      gap: 10,
+    },
+    field: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 4,
+    },
+    label: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: '#59636d',
+    },
+    metricGrid: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit, minmax(125px, 1fr))',
+      gap: 9,
+    },
+    buttons: {
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap',
+      marginTop: 12,
+    },
+    table: {
+      width: '100%',
+      borderCollapse: 'collapse',
+      fontSize: 12,
+    },
+    th: {
+      padding: 8,
+      borderBottom: '1px solid #e2e6e9',
+      textAlign: 'left',
+      background: '#f5f7f9',
+      whiteSpace: 'nowrap',
+    },
+    td: {
+      padding: 8,
+      borderBottom: '1px solid #e2e6e9',
+      textAlign: 'left',
+      whiteSpace: 'nowrap',
+    },
+    note: {
+      fontSize: 11,
+      lineHeight: 1.6,
+      color: '#68737d',
+    },
+    log: {
+      height: 140,
+      overflow: 'auto',
+      background: '#111a22',
+      color: '#d8e3ea',
+      borderRadius: 8,
+      padding: 9,
+      fontSize: 11,
+      fontFamily: 'Consolas, monospace',
+    },
+  }), []);
+
+  return (
+    <div ref={rootRef} style={styles.app}>
+      <header style={styles.header}>
+        <div>
+          <h1 style={styles.title}>🚗 ADAS Route Risk & Accident Simulation</h1>
+          <p style={styles.subtitle}>
+            真實 GeoJSON 道路 × 自動道路分級 × 車道／寬度／速限／車流 × 多角度轉向工況 × LFS PD/AEB × Monte-Carlo。
+            可直接把同一條實際道路換不同 ADAS 版本，觀察模擬事故率與控制表現差異。
+          </p>
+        </div>
+        <div style={{ textAlign: 'right', fontSize: 12, opacity: 0.9 }}>
+          <div>ADAS SiL / HIL Concept Simulator</div>
+          <span>{clock}</span>
+        </div>
+      </header>
+
+      <section style={styles.panel}>
+        <div style={styles.sectionTitle}>⓪ 匯入實際道路／地圖資料（GeoJSON）</div>
+
+        <div style={{ display: 'flex', gap: 9, flexWrap: 'wrap', alignItems: 'center' }}>
+          <input
+            type="file"
+            accept=".geojson,.json,application/geo+json,application/json"
+            onChange={handleGeoJSONFile}
+            style={{
+              border: '1px solid #d9dfe3',
+              borderRadius: 8,
+              padding: 7,
+              background: '#fff',
+            }}
+          />
+          <Button onClick={clearImportedRoad} disabled={!roadCatalog.length && params.routeMode !== 'imported'}>
+            清除實際道路
+          </Button>
+          {mapFileName && <Tag color="blue">資料：{mapFileName}</Tag>}
+          {params.routeMode === 'imported'
+            ? <Tag color="green">目前使用：實際道路路徑</Tag>
+            : <Tag>目前使用：內建模擬道路</Tag>}
+        </div>
+
+        {mapError && (
+          <div style={{
+            marginTop: 9,
+            padding: 9,
+            background: '#fff1f0',
+            borderRadius: 8,
+            color: '#b42318',
+            fontSize: 12,
+          }}>
+            {mapError}
+          </div>
+        )}
+
+        {roadCatalog.length > 0 && (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 800, marginBottom: 7 }}>
+              匯入道路：{roadCatalog.length} 段
+            </div>
+
+            <Select
+              showSearch
+              optionFilterProp="label"
+              value={selectedRoadIndex >= 0 ? selectedRoadIndex : 0}
+              onChange={(idx) => applyRoadCatalogItem(roadCatalog[idx], idx)}
+              style={{ width: '100%', maxWidth: 900 }}
+              options={roadCatalog.map((r, idx) => ({
+                value: idx,
+                label: `${idx + 1}. ${r.name}${r.ref ? ` (${r.ref})` : ''}｜${r.highway}｜${r.roadType.toUpperCase()}｜${r.maneuver?.toUpperCase() || 'S1'}｜${r.lanes} lanes｜${r.widthTotal.toFixed(1)}m｜${r.speedLimit} km/h`,
+              }))}
+            />
+
+            {selectedRoadIndex >= 0 && roadCatalog[selectedRoadIndex] && (
+              <div style={{
+                marginTop: 9,
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))',
+                gap: 8,
+              }}>
+                {miniMetric('道路層級', roadCatalog[selectedRoadIndex].roadType.toUpperCase(), '')}
+                {miniMetric('車道數', roadCatalog[selectedRoadIndex].lanes, 'lanes')}
+                {miniMetric('推估單道寬', roadCatalog[selectedRoadIndex].laneWidth.toFixed(2), 'm')}
+                {miniMetric('總道路寬', roadCatalog[selectedRoadIndex].widthTotal.toFixed(2), 'm')}
+                {miniMetric('速限', roadCatalog[selectedRoadIndex].speedLimit, 'km/h')}
+                {miniMetric('車流條件', roadCatalog[selectedRoadIndex].trafficDensity, '%')}
+                {miniMetric('行駛型態', (roadCatalog[selectedRoadIndex].maneuver || 's1').toUpperCase(), '')}
+                {miniMetric('路徑長度', (roadCatalog[selectedRoadIndex].route.length / 1000).toFixed(2), 'km')}
+              </div>
+            )}
+          </div>
+        )}
+
+        <p style={styles.note}>
+          支援 GeoJSON `FeatureCollection / Feature` 的 `LineString / MultiLineString`。
+          建議從 OSM、地方政府 GIS 或其他道路 GIS 系統匯出 GeoJSON 後匯入。
+          程式會優先讀取道路的 <b>highway、lanes、width / est_width、maxspeed</b> 等屬性；
+          缺少資料時才使用道路層級的預設值。這與 OSM 道路資料常見標籤的用途一致。
+        </p>
+
+        <p style={styles.note}>
+          台灣 OSM tagging 也特別建議以 `width=* / est_width=*` 描述道路寬度、以 `lanes=*` 描述車道數；
+          因此 H4 的「窄道」不會單純因為 `service/alley` 就被硬判定為窄，而會優先採用實際寬度資料。
+        </p>
+      </section>
+
+      <section style={styles.panel}>
+        <div style={styles.sectionTitle}>① 道路與行駛情境</div>
+        <div style={styles.grid}>
+          <div style={styles.field}>
+            <span style={styles.label}>道路層級</span>
+            <Select
+              value={params.roadType}
+              onChange={(v) => {
+                const road = ROAD_TYPES[v];
+                const next = {
+                  ...paramsRef.current,
+                  roadType: v,
+                  laneWidth: road.baseWidth,
+                  customLaneWidth: road.baseWidth,
+                  egoSpeed: Math.min(paramsRef.current.egoSpeed, road.speedLimit),
+                  leadSpeed: Math.min(paramsRef.current.leadSpeed, road.speedLimit),
+                };
+                paramsRef.current = next;
+                setParams(next);
+              }}
+              options={Object.entries(ROAD_TYPES).map(([value, x]) => ({ value, label: x.label }))}
+            />
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>行駛型態</span>
+            <Select
+              value={params.maneuver}
+              onChange={setParam('maneuver')}
+              options={Object.entries(MOVES).map(([value, x]) => ({ value, label: x.label }))}
+            />
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>轉向／道路工況</span>
+            <Select
+              value={params.turnScenario}
+              onChange={(v) => {
+                const ts = TURN_SCENARIOS[v] || TURN_SCENARIOS.straight;
+                const next = {
+                  ...paramsRef.current,
+                  routeMode: paramsRef.current.routeMode === 'imported' ? 'imported' : 'synthetic',
+                  turnScenario: v,
+                  turnAngle: ts.angle,
+                  turnDirection: ts.angle >= 0 ? 1 : -1,
+                  curvRadius: Number.isFinite(ts.radius) ? ts.radius : paramsRef.current.curvRadius,
+                  maneuver: ts.type === 'straight'
+                    ? 's1'
+                    : ts.angle === 90
+                      ? 's4'
+                      : ts.type === 'uturn'
+                        ? 's3'
+                        : ts.angle > 0
+                          ? 's2'
+                          : 's3',
+                };
+                paramsRef.current = next;
+                setParams(next);
+                reset(next, true);
+              }}
+              options={Object.entries(TURN_SCENARIOS).map(([value, x]) => ({
+                value,
+                label: x.label,
+              }))}
+            />
+          </div>
+
+          <div style={{ gridColumn: '1 / -1' }}>
+            <span style={styles.label}>快速轉向角度</span>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 5 }}>
+              {['straight', 'left15', 'left30', 'left45', 'left60', 'left90', 'right15', 'right30', 'right45', 'right60', 'right90', 'u180'].map((key) => (
+                <Button
+                  key={key}
+                  size="small"
+                  type={params.turnScenario === key ? 'primary' : 'default'}
+                  onClick={() => {
+                    const ts = TURN_SCENARIOS[key];
+                    const next = {
+                      ...paramsRef.current,
+                      routeMode: 'synthetic',
+                      turnScenario: key,
+                      turnAngle: ts.angle,
+                      turnDirection: ts.angle >= 0 ? 1 : -1,
+                      maneuver: key === 'straight'
+                        ? 's1'
+                        : key === 'left90'
+                          ? 's4'
+                          : ts.angle > 0
+                            ? 's2'
+                            : 's3',
+                      curvRadius: Number.isFinite(ts.radius) ? ts.radius : paramsRef.current.curvRadius,
+                    };
+                    paramsRef.current = next;
+                    setParams(next);
+                    reset(next, true);
+                  }}
+                >
+                  {TURN_SCENARIOS[key].label}
+                </Button>
+              ))}
+            </div>
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>車道數</span>
+            <Select
+              value={params.laneCount}
+              onChange={(v) => {
+                const next = { ...paramsRef.current, laneCount: v };
+                paramsRef.current = next;
+                setParams(next);
+              }}
+              options={[1, 2, 3].map((v) => ({ value: v, label: `${v} 線道` }))}
+            />
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>道路寬度模式</span>
+            <Select
+              value={params.widthMode}
+              onChange={(v) => {
+                const next = { ...paramsRef.current, widthMode: v };
+                if (v === 'standard') next.laneWidth = ROAD_TYPES[next.roadType].baseWidth;
+                if (v === 'narrow') next.laneWidth = ROAD_TYPES[next.roadType].baseWidth * 0.78;
+                if (v === 'custom') next.laneWidth = finite(next.customLaneWidth, 3.5);
+                paramsRef.current = next;
+                setParams(next);
+              }}
+              options={Object.entries(WIDTH_MODES).map(([value, x]) => ({ value, label: x.label }))}
+            />
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>單一道路寬度 (m)</span>
+            <InputNumber
+              value={params.laneWidth}
+              min={2.2}
+              max={5.0}
+              step={0.1}
+              onChange={(v) => {
+                const n = finite(v, roadWidthFor(params));
+                const next = { ...paramsRef.current, laneWidth: n, customLaneWidth: n };
+                paramsRef.current = next;
+                setParams(next);
+              }}
+            />
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>車流密度 (%)</span>
+            <InputNumber
+              value={params.trafficDensity}
+              min={0}
+              max={100}
+              step={5}
+              onChange={setParam('trafficDensity')}
+            />
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>道路曲率半徑 R (m)</span>
+            <InputNumber
+              value={params.curvRadius}
+              min={25}
+              max={5000}
+              step={5}
+              onChange={setParam('curvRadius')}
+            />
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>彎道方向</span>
+            <Select
+              value={params.turnDirection}
+              onChange={setParam('turnDirection')}
+              options={[
+                { value: 1, label: '左彎' },
+                { value: -1, label: '右彎' },
+              ]}
+            />
+          </div>
+        </div>
+
+        <Divider style={{ margin: '14px 0' }} />
+
+        <div style={styles.metricGrid}>
+          {miniMetric('道路寬度', summaryText.width.toFixed(2), 'm / lane')}
+          {miniMetric('道路難度因子', summaryText.difficulty.toFixed(2), 'simulation factor')}
+          {miniMetric('道路速限參考', ROAD_TYPES[params.roadType]?.speedLimit || 0, 'km/h')}
+          {miniMetric('車道數', params.laneCount, 'lane')}
+          {miniMetric('車流密度', params.trafficDensity, '%')}
+          {miniMetric('轉向角度', params.turnAngle, 'deg')}
+        </div>
+      </section>
+
+      <section style={styles.panel}>
+        <div style={styles.sectionTitle}>② 車輛與 AEB 設定</div>
+        <div style={styles.grid}>
+          <div style={styles.field}>
+            <span style={styles.label}>本車速度 Vego (km/h)</span>
+            <InputNumber value={params.egoSpeed} min={0} max={180} step={1} onChange={setParam('egoSpeed')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>前車速度 Vlead (km/h)</span>
+            <InputNumber value={params.leadSpeed} min={0} max={180} step={1} onChange={setParam('leadSpeed')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>前車初始距離 G (m)</span>
+            <InputNumber value={params.gapDist} min={5} max={200} step={1} onChange={setParam('gapDist')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>初始橫向偏移 e (m)</span>
+            <InputNumber value={params.initialOffset} min={-1.5} max={1.5} step={0.05} onChange={setParam('initialOffset')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>AEB TTC 門檻 (s)</span>
+            <InputNumber value={params.ttcThreshold} min={0.2} max={10} step={0.1} onChange={setParam('ttcThreshold')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>AEB 距離門檻 (m)</span>
+            <InputNumber value={params.distThreshold} min={1} max={80} step={1} onChange={setParam('distThreshold')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>最大減速度 (m/s²)</span>
+            <InputNumber value={params.maxDecel} min={1} max={15} step={0.5} onChange={setParam('maxDecel')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>AEB 反應時間 (s)</span>
+            <InputNumber value={params.aebReactionDelay} min={0.05} max={1.5} step={0.05} onChange={setParam('aebReactionDelay')} />
+          </div>
+        </div>
+        <Checkbox checked={params.hasLead} onChange={(e) => setParam('hasLead')(e.target.checked)} style={{ marginTop: 9 }}>
+          有前車 / Target
+        </Checkbox>
+      </section>
+
+      <section style={styles.panel}>
+        <div style={styles.sectionTitle}>③ ADAS 控制版本參數（改任一參數即可形成不同版本）</div>
+        <div style={styles.grid}>
+          <div style={styles.field}>
+            <span style={styles.label}>LFS Kp</span>
+            <InputNumber value={params.kp} min={0} max={5} step={0.05} onChange={setParam('kp')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>LFS Kd</span>
+            <InputNumber value={params.kd} min={0} max={2} step={0.01} onChange={setParam('kd')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>Heading Gain Kψ</span>
+            <InputNumber value={params.kpsi} min={0} max={3} step={0.05} onChange={setParam('kpsi')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>Sensor Noise</span>
+            <InputNumber value={params.sensorNoise} min={0} max={0.5} step={0.005} onChange={setParam('sensorNoise')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>Steering Noise</span>
+            <InputNumber value={params.steeringNoise} min={0} max={0.5} step={0.005} onChange={setParam('steeringNoise')} />
+          </div>
+          <div style={styles.field}>
+            <span style={styles.label}>Controller Delay (s)</span>
+            <InputNumber value={params.responseDelay} min={0} max={0.5} step={0.01} onChange={setParam('responseDelay')} />
+          </div>
+        </div>
+
+        <div style={{ ...styles.buttons, marginTop: 13 }}>
+          <Button onClick={() => applyPreset('baseline')}>V1 基準</Button>
+          <Button onClick={() => applyPreset('soft')}>V2 柔和</Button>
+          <Button onClick={() => applyPreset('aggressive')}>V3 積極</Button>
+          <Tag color="blue">目前：{PRESETS[selectedPreset]?.name || 'Custom'}</Tag>
+          <Tag color={params.routeMode === 'imported' ? 'green' : 'default'}>
+            {params.routeMode === 'imported' ? '實際道路' : '內建道路'}
+          </Tag>
+        </div>
+
+        <p style={styles.note}>
+          控制公式：Steer = −(Kp·e + Kd·de/dt + Kψ·ψ)。
+          因此可單獨修改 Kp、Kd、Kψ、Sensor Noise、Steering Noise、Controller Delay，
+          直接形成不同 ADAS 控制版本並進行相同道路條件下的比較。
+        </p>
+      </section>
+
+      <section style={styles.panel}>
+        <div style={styles.sectionTitle}>④ Monte-Carlo 事故率模擬</div>
+
+        <div style={styles.grid}>
+          <div style={styles.field}>
+            <span style={styles.label}>試跑次數</span>
+            <Select
+              value={params.mcTrials}
+              onChange={setParam('mcTrials')}
+              options={[10, 30, 50, 100, 300, 500].map((v) => ({ value: v, label: `${v} 次` }))}
+            />
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>單次模擬時間</span>
+            <InputNumber value={params.mcDuration} min={5} max={120} step={5} onChange={setParam('mcDuration')} />
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>速度擾動 σ (km/h)</span>
+            <InputNumber value={params.speedJitter} min={0} max={20} step={1} onChange={setParam('speedJitter')} />
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>車距擾動 σ (m)</span>
+            <InputNumber value={params.gapJitter} min={0} max={30} step={1} onChange={setParam('gapJitter')} />
+          </div>
+
+          <div style={styles.field}>
+            <span style={styles.label}>初始偏移擾動 σ (m)</span>
+            <InputNumber value={params.offsetJitter} min={0} max={0.5} step={0.01} onChange={setParam('offsetJitter')} />
+          </div>
+        </div>
+
+        <div style={styles.buttons}>
+          <Button type="primary" onClick={() => executeMonteCarlo()}>▶ 跑目前 ADAS 版本</Button>
+          <Button onClick={addCurrentVersion}>＋加入目前版本比較</Button>
+          <Button type="primary" danger onClick={batchCompare}>⚡ 一次比較 V1 / V2 / V3</Button>
+          <Button onClick={() => {
+            const items = Object.entries(TURN_SCENARIOS).filter(([,x]) => x.type !== 'straight');
+            setLogs((prev) => [`[TEST] 可用轉向工況：${items.map(([,x]) => x.label).join('、')}`, ...prev].slice(0, 80));
+          }}>↻ 列出轉向工況</Button>
+          <Button onClick={clearComparison}>清除比較結果</Button>
+          <Button type="primary" size="large" onClick={runLive}>▶ 開始動畫模擬</Button>
+          <Button onClick={togglePause} disabled={!running}>{paused ? '▶ 繼續動畫' : 'Ⅱ 暫停動畫'}</Button>
+          <Tag color={running ? 'green' : 'default'}>{running ? `LIVE ${state.t.toFixed(1)} s` : 'READY'}</Tag>
+          <Button onClick={() => reset(paramsRef.current, true)}>↺ 重置</Button>
+        </div>
+
+        <p style={styles.note}>
+          本工具的「事故率」定義為：
+          <b>追撞 / 嚴重車道偏離 / 超出有效道路範圍</b> 任一成立，即計為該次 simulation accident。
+          因此結果適合拿來做「版本 A vs 版本 B」的相對比較，不應直接當成真實世界事故機率。
+        </p>
+
+        {simResult && (
+          <div style={{ ...styles.panel, marginTop: 12, background: '#f7fafc' }}>
+            <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 10 }}>目前 Monte-Carlo 結果</div>
+            <div style={styles.metricGrid}>
+              {miniMetric('模擬事故率', `${(simResult.accidentRate * 100).toFixed(1)}`, '%')}
+              {miniMetric('追撞率', `${(simResult.collisionRate * 100).toFixed(1)}`, '%')}
+              {miniMetric('嚴重偏離率', `${(simResult.laneDepartureRate * 100).toFixed(1)}`, '%')}
+              {miniMetric('平均最小車距', simResult.avgMinGap.toFixed(2), 'm')}
+              {miniMetric('平均最大 |e|', simResult.avgMaxE.toFixed(3), 'm')}
+              {miniMetric('平均 Near Miss', simResult.avgNearMisses.toFixed(2), '/ trial')}
+            </div>
+
+            <div style={{ marginTop: 12 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+                <span>事故率</span>
+                <b>{(simResult.accidentRate * 100).toFixed(1)}%</b>
+              </div>
+              <Progress percent={simResult.accidentRate * 100} />
+            </div>
+          </div>
+        )}
+      </section>
+
+      <section style={styles.panel}>
+        <div style={styles.sectionTitle}>⑤ 即時道路場景</div>
+        <canvas
+          ref={canvasRef}
+          width={1400}
+          height={430}
+          style={{
+            width: '100%',
+            height: 'auto',
+            display: 'block',
+            borderRadius: 10,
+            background: '#647078',
+          }}
+        />
+
+        <div style={{ ...styles.metricGrid, marginTop: 10 }}>
+          {miniMetric('本車速度', kmh(state.egoV).toFixed(1), 'km/h')}
+          {miniMetric('前車距離', state.gap.toFixed(1), 'm')}
+          {miniMetric('橫向誤差 e', state.egoD.toFixed(3), 'm')}
+          {miniMetric('轉向', deg(state.steer).toFixed(2), 'deg')}
+          {miniMetric('加速度', state.accel.toFixed(2), 'm/s²')}
+          {miniMetric('AEB', state.aeb, '')}
+        </div>
+      </section>
+
+      <section style={styles.panel}>
+        <div style={styles.sectionTitle}>⑥ 歷史曲線</div>
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+          gap: 10,
+        }}>
+          <div><canvas ref={chartVRef} width={380} height={180} style={{ width: '100%', height: 180 }} /></div>
+          <div><canvas ref={chartGRef} width={380} height={180} style={{ width: '100%', height: 180 }} /></div>
+          <div><canvas ref={chartERef} width={380} height={180} style={{ width: '100%', height: 180 }} /></div>
+        </div>
+      </section>
+
+      <section style={styles.panel}>
+        <div style={styles.sectionTitle}>⑦ ADAS 版本 × 道路情境比較</div>
+        <div style={{ overflowX: 'auto' }}>
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th style={styles.th}>版本</th>
+                <th style={styles.th}>道路</th>
+                <th style={styles.th}>型態</th>
+                <th style={styles.th}>線道</th>
+                <th style={styles.th}>寬度</th>
+                <th style={styles.th}>車流</th>
+                <th style={styles.th}>Kp</th>
+                <th style={styles.th}>Kd</th>
+                <th style={styles.th}>Kψ</th>
+                <th style={styles.th}>事故率</th>
+                <th style={styles.th}>追撞率</th>
+                <th style={styles.th}>偏離率</th>
+                <th style={styles.th}>Avg Min Gap</th>
+                <th style={styles.th}>Avg |e|</th>
+              </tr>
+            </thead>
+            <tbody>
+              {comparison.length === 0 ? (
+                <tr>
+                  <td colSpan={14} style={{ ...styles.td, color: '#8a949c' }}>尚未有比較結果</td>
+                </tr>
+              ) : comparison.map((r) => (
+                <tr key={r.id}>
+                  <td style={styles.td}><b>{r.label}</b></td>
+                  <td style={styles.td}>{r.road}</td>
+                  <td style={styles.td}>{r.move}</td>
+                  <td style={styles.td}>{r.lanes}</td>
+                  <td style={styles.td}>{r.width.toFixed(2)}</td>
+                  <td style={styles.td}>{r.traffic}%</td>
+                  <td style={styles.td}>{r.kp}</td>
+                  <td style={styles.td}>{r.kd}</td>
+                  <td style={styles.td}>{r.kpsi}</td>
+                  <td style={styles.td}><b>{(r.accidentRate * 100).toFixed(1)}%</b></td>
+                  <td style={styles.td}>{(r.collisionRate * 100).toFixed(1)}%</td>
+                  <td style={styles.td}>{(r.laneDepartureRate * 100).toFixed(1)}%</td>
+                  <td style={styles.td}>{r.avgMinGap.toFixed(2)} m</td>
+                  <td style={styles.td}>{r.avgMaxE.toFixed(3)} m</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section style={styles.panel}>
+        <div style={styles.sectionTitle}>⑧ Event Log</div>
+        <div style={styles.log}>
+          {logs.length === 0
+            ? <div style={{ color: '#778894' }}>尚無事件紀錄</div>
+            : logs.map((x, i) => <div key={`${i}-${x}`} style={{ marginBottom: 3 }}>{x}</div>)}
+        </div>
+
+        <Divider />
+
+        <p style={styles.note}>
+
+          <b>建議的分析方式：</b>
+          先固定道路條件，只改一項 ADAS 參數；再固定 ADAS 版本，依 H1 → H4、
+          S1 → S4、1/2/3 線道、標準／窄道、低／中／高車流做矩陣試驗。
+          最後再把各版本的事故率、追撞率、車道偏離率、平均最小車距與平均橫向誤差放在同一張比較表。
+        </p>
+
+        <p style={styles.note}>
+          ⚠ 這是概念型 SiL / HIL 前期模擬。事故率不是實車事故統計，也不能直接轉換成 TNCAP、
+          Euro NCAP 或量產車安全等級；正式結論仍需實車、感測器性能、ESC/制動、道路環境與正式測試程序驗證。
+        </p>
+      </section>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(<ADASSimulator />);
+</script>
+</body>
+</html>
